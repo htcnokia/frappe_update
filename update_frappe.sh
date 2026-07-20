@@ -1,12 +1,14 @@
 #!/bin/bash
 #
-# Frappe 生产环境自动更新脚本
+# Frappe 生产环境自动更新脚本（修正版）
 # 用法: ./frappe_update.sh
 #
+# 修正点（相对原版）:
 #   1. 开启严格错误模式 set -Eeuo pipefail，任何命令失败立即中止
 #   2. 使用 trap 保证：无论中途成功/失败，都会恢复服务、退出维护模式、释放锁
-#   3. 更新前强制备份数据库+文件
-#   4. git stash 加 -u，保护自建应用中未跟踪(未 git add)的新文件
+#   3. 更新前强制备份数据库+文件（去掉危险的 --no-backup）
+#   4. 不再以"官方/自建"决定是否保护：只要仓库 dirty 就统一 stash -u（含未跟踪文件）保护，
+#      避免官方 app 内的自定义改动(如自定义 Dockerfile 重新生成的翻译文件)被 --reset 冲掉
 #   5. 检测 stash pop 冲突，冲突时不静默继续，而是报警并保留现场供人工处理
 #   6. 增加文件锁，防止脚本被并发执行
 #   7. 增加带时间戳的日志文件
@@ -14,7 +16,7 @@
 #   9. 更新前后进入/退出维护模式，减少用户可见的报错
 #  10. 更新后做基本健康检查（supervisor 状态 + bench doctor）
 #  11. 所有变量加引号，避免路径含空格等问题出错
-#  sudo supervisorctl 需要在 sudoers 里配置免密（NOPASSWD），否则 cron 定时执行会卡在密码输入。
+#
 set -Eeuo pipefail
 
 # ============ 基本配置 ============
@@ -22,8 +24,14 @@ BENCH_PATH="${BENCH_PATH:-$HOME/frappe-bench}"
 LOG_DIR="$BENCH_PATH/logs/auto-update"
 LOG_FILE="$LOG_DIR/update_$(date +%Y%m%d_%H%M%S).log"
 LOCK_FILE="/tmp/frappe_update.lock"
-OFFICIAL_AUTHOR_STRING="Frappe Technologies Pvt. Ltd."
-OFFICIAL_GIT_ORG="github.com/frappe/"
+OFFICIAL_AUTHOR_STRING="Frappe Technologies"
+# 匹配 https://github.com/frappe/xxx 和 git@github.com:frappe/xxx 两种写法
+OFFICIAL_GIT_REGEX="github\.com[:/]frappe/"
+# 兜底名单：即使上面两种检测都判断失误，这些是 Frappe 官方组织下的常见 app，强制视为官方应用
+# 如有其他官方 app（如 insights, crm, wiki, builder 等）请按需追加
+OFFICIAL_APP_NAMES=("frappe" "erpnext" "hrms" "payments" "insights" "lms" "helpdesk" "crm" "builder" "wiki" "drive")
+# 自定义翻译重建脚本路径；留空则跳过这一步
+REBUILD_PO_SCRIPT="${REBUILD_PO_SCRIPT:-$BENCH_PATH/apps/frappe/rebuild_po.py}"
 
 mkdir -p "$LOG_DIR"
 # 所有输出同时写入日志文件
@@ -59,7 +67,7 @@ cleanup() {
     # 恢复所有还没恢复的 stash（避免异常退出时改动丢失在 stash 里而没人知道）
     if [ "${#STASHED_APPS[@]}" -gt 0 ]; then
         for app in "${STASHED_APPS[@]}"; do
-            log "收尾：尝试恢复自建应用改动: $app"
+            log "收尾：尝试恢复暂存的本地改动: $app"
             (
                 cd "$BENCH_PATH/apps/$app" || exit 0
                 if git stash list | grep -q .; then
@@ -131,29 +139,69 @@ for app in "${APPS[@]}"; do
     APP_DIR="$BENCH_PATH/apps/$app"
     [ -d "$APP_DIR" ] || continue
 
-    IS_OFFICIAL=false
-
-    if [ -f "$APP_DIR/pyproject.toml" ] && grep -q "$OFFICIAL_AUTHOR_STRING" "$APP_DIR/pyproject.toml"; then
-        IS_OFFICIAL=true
-    fi
-
-    REMOTE_URL=$(git -C "$APP_DIR" config --get remote.origin.url 2>/dev/null || true)
-    if [[ "$REMOTE_URL" == *"$OFFICIAL_GIT_ORG"* ]]; then
-        IS_OFFICIAL=true
-    fi
-
-    if [ "$IS_OFFICIAL" = true ]; then
-        log "[官方应用] 跳过暂存: $app"
-        continue
-    fi
-
     if [ ! -d "$APP_DIR/.git" ]; then
         log "[非Git应用] 忽略: $app (无法执行 Git 操作)"
         continue
     fi
 
+    # 判断官方 / 自建
+    IS_OFFICIAL=false
+    DETECT_REASON=""
+    for official_name in "${OFFICIAL_APP_NAMES[@]}"; do
+        [ "$app" = "$official_name" ] && IS_OFFICIAL=true && DETECT_REASON="内置名单"
+    done
+    if [ "$IS_OFFICIAL" = false ] && [ -f "$APP_DIR/pyproject.toml" ] \
+        && grep -qi "$OFFICIAL_AUTHOR_STRING" "$APP_DIR/pyproject.toml"; then
+        IS_OFFICIAL=true
+        DETECT_REASON="pyproject.toml 作者信息"
+    fi
+    if [ "$IS_OFFICIAL" = false ]; then
+        REMOTE_URL=$(git -C "$APP_DIR" config --get remote.origin.url 2>/dev/null || true)
+        [[ "$REMOTE_URL" =~ $OFFICIAL_GIT_REGEX ]] && IS_OFFICIAL=true && DETECT_REASON="git remote"
+    fi
+
+    # ============ 官方应用：直接强制对齐远程分支，不做保护 ============
+    # 翻译(.po/.pot)由更新完成后统一执行的 rebuild_po.py 重新生成，
+    # 所以官方应用无需在 git 层面保留任何本地改动/冲突，不管是 pot、po 还是其他文件，一律对齐官方。
+    if [ "$IS_OFFICIAL" = true ]; then
+        if [ -n "$(git -C "$APP_DIR" status --porcelain)" ] || [ -f "$APP_DIR/.git/MERGE_HEAD" ]; then
+            REMOTE_NAME=$(git -C "$APP_DIR" remote | grep -m1 -E '^(upstream|origin)$' || true)
+            [ -z "$REMOTE_NAME" ] && REMOTE_NAME=$(git -C "$APP_DIR" remote | head -1)
+            BRANCH_NAME=$(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD)
+
+            if [ -z "$REMOTE_NAME" ] || [ -z "$BRANCH_NAME" ] || [ "$BRANCH_NAME" = "HEAD" ]; then
+                log "错误：$app 无法确定远程名/分支名(remote=$REMOTE_NAME branch=$BRANCH_NAME)，为安全起见终止更新，请人工处理"
+                exit 1
+            fi
+
+            log "[官方应用] $app 存在本地改动/冲突，直接对齐 $REMOTE_NAME/$BRANCH_NAME (判定依据: $DETECT_REASON)"
+            git -C "$APP_DIR" merge --abort >/dev/null 2>&1 || true
+            if ! git -C "$APP_DIR" fetch "$REMOTE_NAME"; then
+                log "错误：$app 拉取远程 $REMOTE_NAME 失败，终止更新"
+                exit 1
+            fi
+            git -C "$APP_DIR" reset --hard "$REMOTE_NAME/$BRANCH_NAME"
+            git -C "$APP_DIR" clean -fd
+            log "[官方应用] $app 已对齐 $REMOTE_NAME/$BRANCH_NAME"
+        else
+            log "[官方应用] $app 干净无改动"
+        fi
+        continue
+    fi
+
+    # ============ 自建应用：保留 stash 保护逻辑 ============
+    # 前置检测：仓库是否处于未完成合并 / 存在未合并路径，自建应用的冲突无法自动判断取舍，一律交人工处理
+    if [ -f "$APP_DIR/.git/MERGE_HEAD" ] || git -C "$APP_DIR" status --porcelain | grep -qE '^(UU|AA|DD|AU|UA|UD|DU) '; then
+        log "错误：$app (自建应用) 存在未完成的合并/冲突状态，无法安全暂存，为避免破坏代码终止更新"
+        log "请登录服务器手动处理: cd $APP_DIR && git status"
+        log "  - 若显示合并进行中: git merge --abort"
+        log "  - 若确认无需保留本地内容: git fetch <remote> && git reset --hard <remote>/<分支名> && git clean -fd"
+        log "  - 若冲突文件中有需要保留的自定义改动，务必先手工解决冲突并 commit，不要直接 reset --hard"
+        exit 1
+    fi
+
     if [ -n "$(git -C "$APP_DIR" status --porcelain)" ]; then
-        log "[自建应用] 发现修改，正在暂存(含未跟踪文件): $app"
+        log "[自建应用] 发现本地改动，正在暂存(含未跟踪文件): $app"
         # 关键修正：加 -u，防止 bench update --reset 时把新增的未跟踪文件清掉
         if git -C "$APP_DIR" stash push -u -m "auto-update-$(date +%Y%m%d_%H%M%S)"; then
             STASHED_APPS+=("$app")
@@ -171,10 +219,10 @@ done
 log "--- 正在执行核心更新 (bench update --reset --requirements) ---"
 bench update --reset --requirements
 
-# 6. 恢复自建应用修改，并在数组中标记为已恢复，避免 trap 重复处理
+# 6. 恢复所有被暂存的本地改动(不分官方/自建)，并在数组中标记为已恢复，避免 trap 重复处理
 RESTORED_APPS=()
 for app in "${STASHED_APPS[@]}"; do
-    log "正在恢复自建应用修改: $app"
+    log "正在恢复本地改动: $app"
     if git -C "$BENCH_PATH/apps/$app" stash pop; then
         RESTORED_APPS+=("$app")
     else
@@ -200,6 +248,18 @@ log "执行 migrate / build / clear-cache"
 bench migrate
 bench build
 bench clear-cache
+
+# 7.5 重新生成翻译（因为更新阶段 .pot 冲突自动采用了 upstream 版本，需要重新生成以对齐最新翻译）
+if [ -n "$REBUILD_PO_SCRIPT" ] && [ -f "$REBUILD_PO_SCRIPT" ]; then
+    log "重新生成翻译: $REBUILD_PO_SCRIPT"
+    if python3 "$REBUILD_PO_SCRIPT"; then
+        log "翻译重建完成"
+    else
+        log "警告：翻译重建脚本执行失败，请人工检查（不影响本次更新的其余部分）"
+    fi
+else
+    log "未配置或未找到翻译重建脚本，跳过 (REBUILD_PO_SCRIPT=$REBUILD_PO_SCRIPT)"
+fi
 
 # 8. 重启服务
 log "重启 supervisor 服务"
