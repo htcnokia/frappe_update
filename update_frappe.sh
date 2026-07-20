@@ -216,8 +216,6 @@ else
     log "已获取 ${#OFFICIAL_APPS[@]} 个官方仓库。"
 fi
 
-OFFICIAL_APPS+=("erpnext_china" "zh_localization" "wxwork_login")
-
 # ---- 7. 进入维护模式 ----
 log "开启全站维护模式..."
 bench --site all set-maintenance-mode on
