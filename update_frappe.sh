@@ -189,8 +189,19 @@ log "从 GitHub API 获取 Frappe 官方仓库列表..."
 OFFICIAL_APPS=()
 GITHUB_API_OK=1
 
+# 在此定义你的 GitHub API Token（建议使用具有 public_repo 权限的 Personal Access Token）
+# export GITHUB_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
+# 如果留空，脚本会自动尝试无 Token 请求，受 60 次/小时限制
+GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+
+# 组装 curl 的 headers
+CURL_HEADERS=(-sf --connect-timeout 10)
+if [ -n "$GITHUB_TOKEN" ]; then
+    CURL_HEADERS+=(-H "Authorization: token $GITHUB_TOKEN")
+fi
+
 for page in 1 2 3; do
-    result=$(curl -sf --connect-timeout 10 \
+    result=$(curl "${CURL_HEADERS[@]}" \
         "https://api.github.com/orgs/frappe/repos?per_page=100&page=${page}") \
         || { GITHUB_API_OK=0; break; }
     [ -z "$result" ] && break
@@ -246,30 +257,42 @@ SERVICES_STOPPED=1
 log "扫描并对齐应用状态..."
 APPS=$(cat sites/apps.txt)
 
-# 显式初始化为空数组，防止 set -u 在无自建应用暂存时报 unbound variable 错误
+# 显式初始化为空数组
 declare -a STASHED_APPS=()
+
+# 定义你需要同步更新的第三方/自定义开源应用白名单
+THIRD_PARTY_UPDATED_APPS=("erpnext_china")
 
 for app in $APPS; do
     APP_DIR="apps/$app"
     [ -d "$APP_DIR/.git" ] || continue
 
     IS_OFFICIAL=false
+    
+    # 1. 检查是否为官方应用
     for official in "${OFFICIAL_APPS[@]}"; do
         [[ "$app" == "$official" ]] && IS_OFFICIAL=true && break
     done
 
+    # 2. 检查是否在你的第三方更新白名单中
+    if [ "$IS_OFFICIAL" = false ]; then
+        for tp in "${THIRD_PARTY_UPDATED_APPS[@]}"; do
+            [[ "$app" == "$tp" ]] && IS_OFFICIAL=true && break
+        done
+    fi
+
     if [ "$IS_OFFICIAL" = true ]; then
-        log "[官方应用] 强制对齐: $app"
+        log "[强制对齐应用] 强制更新/重置: $app"
         git -C "$APP_DIR" merge --abort >/dev/null 2>&1 || true
         git -C "$APP_DIR" reset --hard HEAD
         git -C "$APP_DIR" clean -fd
     else
         if [[ -n $(git -C "$APP_DIR" status --porcelain) ]]; then
-            log "[自建应用] 暂存本地修改: $app"
+            log "[纯自建应用] 暂存本地修改: $app"
             git -C "$APP_DIR" stash -u
             STASHED_APPS+=("$app")
         else
-            log "[自建应用] 状态干净: $app"
+            log "[纯自建应用] 状态干净: $app"
         fi
     fi
 done
@@ -311,7 +334,7 @@ bench migrate
 
 # ---- 14. 重建翻译文件 ----
 log "重建翻译模板..."
-python3 apps/frappe/rebuild_po.py 2>/dev/null || log "[WARN] 翻译重建跳过。"
+./translate_llm_local.sh
 
 # ---- 15. 编译静态资源 ----
 log "编译 JS/CSS 静态资源..."
