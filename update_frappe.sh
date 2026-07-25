@@ -261,7 +261,7 @@ APPS=$(cat sites/apps.txt)
 declare -a STASHED_APPS=()
 
 # 定义你需要同步更新的第三方/自定义开源应用白名单
-THIRD_PARTY_UPDATED_APPS=("erpnext_china")
+THIRD_PARTY_UPDATED_APPS=("frappe_locale")
 
 for app in $APPS; do
     APP_DIR="apps/$app"
@@ -285,6 +285,48 @@ for app in $APPS; do
         log "[强制对齐应用] 强制更新/重置: $app"
         git -C "$APP_DIR" merge --abort >/dev/null 2>&1 || true
         git -C "$APP_DIR" reset --hard HEAD
+        git -C "$APP_DIR" clean -fd
+    else
+        if [[ -n $(git -C "$APP_DIR" status --porcelain) ]]; then
+            log "[纯自建应用] 暂存本地修改: $app"
+            git -C "$APP_DIR" stash -u
+            STASHED_APPS+=("$app")
+        else
+            log "[纯自建应用] 状态干净: $app"
+        fi
+    fi
+done
+
+# ---- 10. 应用状态对齐（彻底清理旧翻译与本地修改） ----
+log "扫描并对齐应用状态（将彻底清理旧的 PO 文件及未追踪文件）..."
+APPS=$(cat sites/apps.txt)
+
+declare -a STASHED_APPS=()
+THIRD_PARTY_UPDATED_APPS=("frappe_locale")
+
+for app in $APPS; do
+    APP_DIR="apps/$app"
+    [ -d "$APP_DIR/.git" ] || continue
+
+    IS_OFFICIAL=false
+    
+    # 检查是否为官方应用
+    for official in "${OFFICIAL_APPS[@]}"; do
+        [[ "$app" == "$official" ]] && IS_OFFICIAL=true && break
+    done
+
+    # 检查是否在第三方白名单中
+    if [ "$IS_OFFICIAL" = false ]; then
+        for tp in "${THIRD_PARTY_UPDATED_APPS[@]}"; do
+            [[ "$app" == "$tp" ]] && IS_OFFICIAL=true && break
+        done
+    fi
+
+    if [ "$IS_OFFICIAL" = true ]; then
+        log "[强制对齐应用] 彻底重置并清理未追踪文件（含旧翻译 PO）: $app"
+        git -C "$APP_DIR" merge --abort >/dev/null 2>&1 || true
+        git -C "$APP_DIR" reset --hard HEAD
+        # -f 强制清理，-d 包含未追踪的目录，-x 连被 .gitignore 忽略的文件也一并清除（可按需保留）
         git -C "$APP_DIR" clean -fd
     else
         if [[ -n $(git -C "$APP_DIR" status --porcelain) ]]; then
@@ -321,7 +363,7 @@ if [ "${#STASHED_APPS[@]}" -gt 0 ]; then
     done
 fi
 
-# ---- 13. 数据库迁移（增加 Redis 存活二次确保）----
+# ---- 13. 数据库迁移 ----
 log "再次强行确保 Redis 运行，执行数据库迁移..."
 sudo systemctl start redis-server 2>/dev/null || sudo systemctl start redis 2>/dev/null || true
 if command -v supervisorctl &>/dev/null; then
@@ -332,9 +374,9 @@ fi
 log "执行数据库迁移（Schema Migration）..."
 bench migrate
 
-# ---- 14. 重建翻译文件 ----
-log "重建翻译模板..."
-./translate_llm_local.sh
+# ---- 14. 重新生成并执行大模型翻译 ----
+log "基于最新源码重新生成并执行本地大模型翻译..."
+/home/frappe/frappe-bench/translate_llm_local.sh
 
 # ---- 15. 编译静态资源 ----
 log "编译 JS/CSS 静态资源..."
