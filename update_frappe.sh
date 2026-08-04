@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
 # Frappe/ERPNext 生产环境企业级自动更新脚本
-# 集成：多环境 bench App.tag 源码热补丁 + 服务依赖自动修复
+# 集成：多环境 bench App.tag 源码热补丁 + 服务依赖自动修复 + 更新结果总结报告
 # ==============================================================================
 # 使用前提：
 # 1. 以 frappe 用户运行（绝不能 sudo ./此脚本）
@@ -53,6 +53,7 @@ cleanup_on_failure() {
     fi
 
     log "[FATAL] 更新已中止，日志路径: $LOG_FILE"
+    print_summary
     exit "$exit_code"
 }
 
@@ -184,48 +185,72 @@ for app_py in sorted(all_paths):
 print(f"[热补丁] 完成：注入 {patched} 个文件，跳过 {skipped} 个。")
 PYEOF
 
-# ---- 6. 动态获取官方白名单 ----
-log "从 GitHub API 获取 Frappe 官方仓库列表..."
-OFFICIAL_APPS=()
-GITHUB_API_OK=1
+# ---- 6. 版本追踪辅助函数 & 汇总数据结构 ----
+# 记录每个 app 在更新前/后的 commit 与可读版本号（tag 或短 hash）
+declare -A BEFORE_COMMIT
+declare -A AFTER_COMMIT
+declare -A BEFORE_VER
+declare -A AFTER_VER
 
-# 在此定义你的 GitHub API Token（建议使用具有 public_repo 权限的 Personal Access Token）
-# export GITHUB_TOKEN="ghp_xxxxxxxxxxxxxxxxxxxx"
-# 如果留空，脚本会自动尝试无 Token 请求，受 60 次/小时限制
-GITHUB_TOKEN="${GITHUB_TOKEN:-}"
+# 分类结果，用于最终总结
+declare -a FORCE_UPDATED_APPS=()   # 走了 reset 强制对齐的 app（官方/第三方）
+declare -a CUSTOM_PRESENT_APPS=()  # 实际安装且命中白名单的自建 app（跳过 reset）
+declare -a STASHED_APPS=()         # 自建 app 中确实有改动、被 stash 的
+declare -a FAILED_APPS=()          # stash pop 失败、需要人工处理的
 
-# 组装 curl 的 headers
-CURL_HEADERS=(-sf --connect-timeout 10)
-if [ -n "$GITHUB_TOKEN" ]; then
-    CURL_HEADERS+=(-H "Authorization: token $GITHUB_TOKEN")
-fi
+get_commit() { git -C "apps/$1" rev-parse --short HEAD 2>/dev/null || echo "unknown"; }
+get_ver()    { git -C "apps/$1" describe --tags --always 2>/dev/null || echo "unknown"; }
 
-for page in 1 2 3; do
-    result=$(curl "${CURL_HEADERS[@]}" \
-        "https://api.github.com/orgs/frappe/repos?per_page=100&page=${page}") \
-        || { GITHUB_API_OK=0; break; }
-    [ -z "$result" ] && break
-    names=$(echo "$result" | python3 -c \
-        "import sys,json; print('\n'.join(r['name'] for r in json.load(sys.stdin)))" \
-        2>/dev/null) || { GITHUB_API_OK=0; break; }
-    [ -z "$names" ] && break
-    while IFS= read -r name; do
-        [ -n "$name" ] && OFFICIAL_APPS+=("$name")
-    done <<< "$names"
-done
+print_summary() {
+    log "======================================================================"
+    log "更新结果总结"
+    log "======================================================================"
 
-if [ "$GITHUB_API_OK" -eq 0 ] || [ "${#OFFICIAL_APPS[@]}" -eq 0 ]; then
-    log "[WARN] GitHub API 不可用，启用离线静态白名单..."
-    OFFICIAL_APPS=(
-        "frappe" "erpnext" "hrms" "payments" "insights" "lms"
-        "helpdesk" "crm" "builder" "wiki" "drive" "flow"
-        "draw" "sheets" "telephony" "gameplan" "print_designer"
-        "webshop" "lending" "education" "agriculture" "hospitality"
-        "non_profit" "ecommerce_integrations"
-    )
-else
-    log "已获取 ${#OFFICIAL_APPS[@]} 个官方仓库。"
-fi
+    if [ "${#FORCE_UPDATED_APPS[@]}" -gt 0 ]; then
+        log "【强制对齐应用（官方/第三方）】"
+        for app in "${FORCE_UPDATED_APPS[@]}"; do
+            local bc="${BEFORE_COMMIT[$app]:-unknown}"
+            local ac="${AFTER_COMMIT[$app]:-unknown}"
+            local bv="${BEFORE_VER[$app]:-unknown}"
+            local av="${AFTER_VER[$app]:-unknown}"
+            if [ "$bc" = "$ac" ]; then
+                log "  - $app : 无变化（版本 $bv，commit $bc）"
+            else
+                log "  - $app : $bv ($bc)  ->  $av ($ac)"
+            fi
+        done
+    else
+        log "【强制对齐应用（官方/第三方）】无"
+    fi
+
+    if [ "${#CUSTOM_PRESENT_APPS[@]}" -gt 0 ]; then
+        log "【自建应用（已跳过强制重置，受保护）】"
+        for app in "${CUSTOM_PRESENT_APPS[@]}"; do
+            local is_stashed=false
+            local is_failed=false
+            for s in "${STASHED_APPS[@]}"; do [ "$s" = "$app" ] && is_stashed=true; done
+            for f in "${FAILED_APPS[@]}"; do [ "$f" = "$app" ] && is_failed=true; done
+
+            if [ "$is_failed" = true ]; then
+                log "  - $app : 跳过更新，本地改动通过 stash 保护，但恢复(stash pop)失败，需人工处理！改动保留在 git stash 中。"
+            elif [ "$is_stashed" = true ]; then
+                log "  - $app : 跳过更新，本地改动已通过 stash 保护并成功恢复。"
+            else
+                log "  - $app : 跳过更新，本次运行前无未提交改动。"
+            fi
+        done
+    else
+        log "【自建应用】无（当前 apps.txt 中未发现 MY_CUSTOM_APPS 白名单中的应用）"
+    fi
+
+    if [ "${#FAILED_APPS[@]}" -gt 0 ]; then
+        log "【⚠ 需要人工介入的应用】${FAILED_APPS[*]}"
+    else
+        log "【需要人工介入的应用】无"
+    fi
+
+    log "======================================================================"
+}
 
 # ---- 7. 进入维护模式 ----
 log "开启全站维护模式..."
@@ -253,82 +278,33 @@ if command -v supervisorctl &>/dev/null; then
 fi
 SERVICES_STOPPED=1
 
-# ---- 10. 应用状态对齐 ----
-log "扫描并对齐应用状态..."
+# ---- 10. 应用状态对齐（只对非自建app强制重置） ----
+log "扫描并对齐应用状态（自建app受保护，其余app彻底重置）..."
 APPS=$(cat sites/apps.txt)
 
-# 显式初始化为空数组
-declare -a STASHED_APPS=()
+# 手动维护你自己的自建app名单：新增自建app时务必同步加到这里，
+# 否则会被当成"非自建"直接 reset --hard + clean -fd，改动会丢失！
+MY_CUSTOM_APPS=("kingdee_sync" "wxwork_login" "hrinfo_sync")
 
-# 定义你需要同步更新的第三方/自定义开源应用白名单
-THIRD_PARTY_UPDATED_APPS=("frappe_locale")
-
+# 先记录更新前的版本/commit信息（所有已安装的app都记录，不论是否自建）
 for app in $APPS; do
     APP_DIR="apps/$app"
     [ -d "$APP_DIR/.git" ] || continue
-
-    IS_OFFICIAL=false
-    
-    # 1. 检查是否为官方应用
-    for official in "${OFFICIAL_APPS[@]}"; do
-        [[ "$app" == "$official" ]] && IS_OFFICIAL=true && break
-    done
-
-    # 2. 检查是否在你的第三方更新白名单中
-    if [ "$IS_OFFICIAL" = false ]; then
-        for tp in "${THIRD_PARTY_UPDATED_APPS[@]}"; do
-            [[ "$app" == "$tp" ]] && IS_OFFICIAL=true && break
-        done
-    fi
-
-    if [ "$IS_OFFICIAL" = true ]; then
-        log "[强制对齐应用] 强制更新/重置: $app"
-        git -C "$APP_DIR" merge --abort >/dev/null 2>&1 || true
-        git -C "$APP_DIR" reset --hard HEAD
-        git -C "$APP_DIR" clean -fd
-    else
-        if [[ -n $(git -C "$APP_DIR" status --porcelain) ]]; then
-            log "[纯自建应用] 暂存本地修改: $app"
-            git -C "$APP_DIR" stash -u
-            STASHED_APPS+=("$app")
-        else
-            log "[纯自建应用] 状态干净: $app"
-        fi
-    fi
+    BEFORE_COMMIT[$app]=$(get_commit "$app")
+    BEFORE_VER[$app]=$(get_ver "$app")
 done
 
-# ---- 10. 应用状态对齐（彻底清理旧翻译与本地修改） ----
-log "扫描并对齐应用状态（将彻底清理旧的 PO 文件及未追踪文件）..."
-APPS=$(cat sites/apps.txt)
-
-declare -a STASHED_APPS=()
-THIRD_PARTY_UPDATED_APPS=("frappe_locale")
-
 for app in $APPS; do
     APP_DIR="apps/$app"
     [ -d "$APP_DIR/.git" ] || continue
 
-    IS_OFFICIAL=false
-    
-    # 检查是否为官方应用
-    for official in "${OFFICIAL_APPS[@]}"; do
-        [[ "$app" == "$official" ]] && IS_OFFICIAL=true && break
+    IS_MINE=false
+    for mine in "${MY_CUSTOM_APPS[@]}"; do
+        [[ "$app" == "$mine" ]] && IS_MINE=true && break
     done
 
-    # 检查是否在第三方白名单中
-    if [ "$IS_OFFICIAL" = false ]; then
-        for tp in "${THIRD_PARTY_UPDATED_APPS[@]}"; do
-            [[ "$app" == "$tp" ]] && IS_OFFICIAL=true && break
-        done
-    fi
-
-    if [ "$IS_OFFICIAL" = true ]; then
-        log "[强制对齐应用] 彻底重置并清理未追踪文件（含旧翻译 PO）: $app"
-        git -C "$APP_DIR" merge --abort >/dev/null 2>&1 || true
-        git -C "$APP_DIR" reset --hard HEAD
-        # -f 强制清理，-d 包含未追踪的目录，-x 连被 .gitignore 忽略的文件也一并清除（可按需保留）
-        git -C "$APP_DIR" clean -fd
-    else
+    if [ "$IS_MINE" = true ]; then
+        CUSTOM_PRESENT_APPS+=("$app")
         if [[ -n $(git -C "$APP_DIR" status --porcelain) ]]; then
             log "[纯自建应用] 暂存本地修改: $app"
             git -C "$APP_DIR" stash -u
@@ -336,6 +312,12 @@ for app in $APPS; do
         else
             log "[纯自建应用] 状态干净: $app"
         fi
+    else
+        log "[强制对齐应用] 彻底重置并清理未追踪文件: $app"
+        FORCE_UPDATED_APPS+=("$app")
+        git -C "$APP_DIR" merge --abort >/dev/null 2>&1 || true
+        git -C "$APP_DIR" reset --hard HEAD
+        git -C "$APP_DIR" clean -fd
     fi
 done
 
@@ -358,10 +340,25 @@ bench update --reset --no-backup
 if [ "${#STASHED_APPS[@]}" -gt 0 ]; then
     for app in "${STASHED_APPS[@]}"; do
         log "恢复自建应用暂存: $app"
-        git -C "apps/$app" stash pop \
-            || log "[WARN] $app 恢复暂存失败，可能存在代码冲突，请手动检查。"
+        if ! git -C "apps/$app" stash pop; then
+            log "[ERROR] $app 恢复暂存失败，存在冲突！"
+            FAILED_APPS+=("$app")
+        fi
     done
+    if [ "${#FAILED_APPS[@]}" -gt 0 ]; then
+        log "[FATAL] 以下自建app的改动未能自动恢复，需要人工处理: ${FAILED_APPS[*]}"
+        log "[FATAL] 对应改动仍保存在各自的 git stash 中，请勿丢弃！"
+        exit 1
+    fi
 fi
+
+# 更新后记录版本/commit信息
+for app in $APPS; do
+    APP_DIR="apps/$app"
+    [ -d "$APP_DIR/.git" ] || continue
+    AFTER_COMMIT[$app]=$(get_commit "$app")
+    AFTER_VER[$app]=$(get_ver "$app")
+done
 
 # ---- 13. 数据库迁移 ----
 log "再次强行确保 Redis 运行，执行数据库迁移..."
@@ -395,6 +392,9 @@ SERVICES_STOPPED=0
 log "关闭维护模式，恢复对外访问..."
 bench --site all set-maintenance-mode off
 MAINTENANCE_MODE_ACTIVE=0
+
+# ---- 19. 输出最终总结报告 ----
+print_summary
 
 log "======================================================================"
 log "SUCCESS: 生产环境更新全部完成。"
